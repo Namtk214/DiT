@@ -115,10 +115,20 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, return_attn=False):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+
+        # Attention branch
+        attn_out = self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        if return_attn:
+            attn_weights = attn_out  # Store attention for later if needed
+        x = x + gate_msa.unsqueeze(1) * attn_out
+
+        # MLP branch
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+
+        if return_attn:
+            return x, attn_weights
         return x
 
 
@@ -230,31 +240,46 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, return_block_tokens=False):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        return_block_tokens: if True, return list of block output tokens for similarity analysis
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
+
+        block_tokens = [] if return_block_tokens else None
+
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
+            if return_block_tokens:
+                block_tokens.append(x)           # Save block output tokens
+
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
+
+        if return_block_tokens:
+            return x, block_tokens
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale, return_block_tokens=False):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+
+        if return_block_tokens:
+            model_out, block_tokens = self.forward(combined, t, y, return_block_tokens=True)
+        else:
+            model_out = self.forward(combined, t, y, return_block_tokens=False)
+
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
@@ -263,7 +288,15 @@ class DiT(nn.Module):
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        result = torch.cat([eps, rest], dim=1)
+
+        if return_block_tokens:
+            # Extract only conditional branch block tokens
+            B = half.shape[0]
+            block_tokens_cond = [bt[:B] for bt in block_tokens]
+            return result, block_tokens_cond
+
+        return result
 
 
 #################################################################################
