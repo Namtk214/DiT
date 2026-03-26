@@ -1,0 +1,406 @@
+DiT Block-wise + Cross-Timestep Patch-wise Cosine Similarity during Inference
+=============================================================================
+
+Mục tiêu
+--------
+File này mô tả phần THAY ĐỔI so với setting cũ chỉ đo block-wise cosine similarity trong cùng một timestep.
+
+Setting cũ:
+- Với mỗi timestep t_k, lấy output token của mọi block trong DiT.
+- Tính cosine similarity patch-wise giữa mọi cặp block trong cùng timestep đó.
+- Kết quả tại mỗi timestep là một ma trận [L, L].
+- Nếu có T timestep được chọn để đo, output cuối là tensor [T, L, L].
+- Ví dụ DiT-XL với L = 27 block, chọn T = 10 timestep -> output cũ là 10 heatmap, mỗi heatmap có kích thước 27 x 27.
+
+Setting mới (mở rộng):
+- Không chỉ đo tương quan giữa các block trong cùng timestep nữa.
+- Ta đo luôn tương quan giữa block ở timestep này với block ở timestep khác.
+- Tức là với mọi cặp (timestep, block), ta xem đó như một node biểu diễn riêng.
+- Kết quả đầy đủ sẽ là tensor [T, L, T, L].
+- Nếu flatten hai trục (timestep, block), ta được một ma trận lớn [(T*L), (T*L)].
+
+Ví dụ cụ thể
+-----------
+Với DiT-XL:
+- Số block: L = 27
+- Số timestep chọn để đo: T = 10
+
+Khi đó:
+- Output cũ: [10, 27, 27]
+- Output mới: [10, 27, 10, 27]
+- Nếu flatten: [270, 270]
+
+Diễn giải trực quan:
+- Trước đây: có 10 heatmap, mỗi heatmap là block-vs-block trong cùng timestep.
+- Bây giờ: có 100 heatmap con, mỗi heatmap con là block-vs-block giữa timestep i và timestep j.
+- Toàn bộ 100 heatmap này có thể tổ chức thành một lưới 10 x 10.
+- Hoặc gộp lại thành một heatmap lớn 270 x 270.
+
+------------------------------------------------------------------
+1) Định nghĩa representation cần lấy
+------------------------------------------------------------------
+
+Tại timestep t_k, output của block l là:
+
+    h_k^(l) in R^{B x N x D}
+
+trong đó:
+- B: batch size
+- N: số patch token
+- D: hidden dimension
+- l = 1..L là chỉ số block
+- k = 1..T là chỉ số timestep được chọn để phân tích
+
+Ta vẫn giữ đúng logic của file cũ:
+- so sánh các token có cùng patch index n
+- vì số token N không đổi qua các block và thứ tự patch token được giữ nguyên
+- nên patch n ở block này và patch n ở block kia vẫn tương ứng với cùng vị trí spatial gốc
+
+Khi mở rộng sang cross-timestep, ta vẫn dùng cùng logic đó:
+- patch n ở block a tại timestep t_k
+- được so với patch n ở block b tại timestep t_k'
+
+Ý nghĩa:
+- đo xem representation của cùng vị trí spatial thay đổi thế nào theo cả chiều sâu block lẫn diffusion time.
+
+------------------------------------------------------------------
+2) Công thức toán học mới
+------------------------------------------------------------------
+
+Gọi:
+
+    h_k^(a)[j, n] in R^D
+    h_k'^(b)[j, n] in R^D
+
+là token tại:
+- sample j
+- patch n
+- block a ở timestep k
+- block b ở timestep k'
+
+Ta định nghĩa cosine similarity patch-wise như sau:
+
+    c_{k,a,k',b}(j,n)
+      = < h_k^(a)[j,n], h_k'^(b)[j,n] >
+        / ( ||h_k^(a)[j,n]|| * ||h_k'^(b)[j,n]|| )
+
+Sau đó average trên batch và patch:
+
+    C[k,a,k',b]
+      = (1 / (B*N)) * sum_j sum_n c_{k,a,k',b}(j,n)
+
+Kết quả đầy đủ:
+
+    C in R^{T x L x T x L}
+
+Đây là tensor similarity mới.
+
+Nếu cần flatten để visualize:
+- gộp (k, a) thành một trục
+- gộp (k', b) thành một trục
+
+Ta được:
+
+    M in R^{(T*L) x (T*L)}
+
+với mapping index ví dụ:
+
+    idx(k, a) = k * L + a
+
+(khi code có thể dùng index từ 0)
+
+Khi đó:
+
+    M[idx(k,a), idx(k',b)] = C[k,a,k',b]
+
+------------------------------------------------------------------
+3) Quan hệ giữa output cũ và output mới
+------------------------------------------------------------------
+
+Output cũ chỉ là trường hợp đặc biệt của output mới.
+
+Cụ thể:
+- Ma trận similarity cũ tại timestep k là:
+
+    S_k[a,b]
+
+- Trong tensor mới, nó chính là block chéo theo timestep:
+
+    S_k[a,b] = C[k,a,k,b]
+
+Nói cách khác:
+- các block con C[k, :, k, :] là similarity trong cùng timestep
+- các block con C[k, :, k', :] với k != k' là similarity giữa hai timestep khác nhau
+
+Vì vậy, output mới bao hàm hoàn toàn output cũ.
+
+------------------------------------------------------------------
+4) Output cần log / save
+------------------------------------------------------------------
+
+Khuyến nghị lưu 3 mức output:
+
+Mức A. Raw tensor đầy đủ
+------------------------
+
+    cross_sim_4d.shape = [T, L, T, L]
+
+Ví dụ:
+
+    [10, 27, 10, 27]
+
+Đây là dữ liệu gốc tốt nhất cho phân tích.
+
+Mức B. Grid heatmap theo cặp timestep
+-------------------------------------
+
+Ta visualize thành lưới T x T.
+- Hàng i: timestep nguồn t_i
+- Cột j: timestep đích t_j
+- Mỗi ô con là một heatmap [L, L]
+
+Ví dụ với T = 10:
+- toàn bộ figure sẽ là grid 10 x 10
+- mỗi ô con là heatmap 27 x 27
+
+Ý nghĩa:
+- ô (i, i): heatmap gốc trong cùng timestep
+- ô (i, j): heatmap cross-timestep giữa timestep i và j
+
+Đây là format dễ đọc nhất cho phân tích.
+
+Mức C. Heatmap lớn sau khi flatten
+----------------------------------
+
+Flatten tensor [T, L, T, L] thành:
+
+    cross_sim_2d.shape = [T*L, T*L]
+
+Ví dụ:
+
+    [270, 270]
+
+Heatmap này sẽ có cấu trúc block như sau:
+- chia thành T x T ô lớn
+- mỗi ô lớn có kích thước L x L
+- với DiT-XL + 10 timestep: 10 x 10 ô lớn, mỗi ô lớn 27 x 27
+
+Format này đẹp để nhìn global pattern, nhưng khó đọc chi tiết hơn grid T x T.
+
+------------------------------------------------------------------
+5) Thay đổi cần làm trong model / inference
+------------------------------------------------------------------
+
+API model
+---------
+Cần đảm bảo forward có thể trả về output token của từng block.
+
+Ví dụ API:
+
+    forward(x, t, y, return_block_tokens=False)
+
+Nếu return_block_tokens=False:
+- chạy bình thường, chỉ trả pred
+
+Nếu return_block_tokens=True:
+- trả thêm:
+
+    block_tokens = [h^(1), h^(2), ..., h^(L)]
+
+mỗi phần tử có shape [B, N, D]
+
+Khuyến nghị:
+- luôn lưu output cuối block để nhất quán
+- không đổi vị trí lấy hidden giữa các block
+
+Inference flow mới
+------------------
+Tại mỗi timestep phân tích t_k:
+
+1. Có latent hiện tại x_{t_k}
+2. Gọi:
+
+       pred, block_tokens = model(x_{t_k}, t_k, y, return_block_tokens=True)
+
+3. Nếu dùng CFG, tách nhánh cond/uncond trước khi phân tích
+4. Stack block_tokens thành tensor [L, B, N, D]
+5. Lưu tensor này cho timestep k
+6. Dùng pred để update latent sang timestep tiếp theo
+7. Lặp lại cho tất cả timestep cần phân tích
+
+Sau cùng:
+- stack toàn bộ hidden theo timestep
+- thu được tensor H shape [T, L, B, N, D]
+
+Từ H, tính similarity mới:
+
+    cross_sim_4d = [T, L, T, L]
+
+và nếu cần:
+
+    cross_sim_2d = [T*L, T*L]
+
+------------------------------------------------------------------
+6) Pseudocode tính similarity mới
+------------------------------------------------------------------
+
+Pseudo:
+
+    # H: [T, L, B, N, D]
+    H = H / (norm(H, axis=-1, keepdims=True) + eps)
+
+    # broadcast pairwise over (T, L) x (T, L)
+    # result shape: [T, L, T, L, B, N]
+    sim = (H[:, :, None, None] * H[None, None, :, :]).sum(axis=-1)
+
+    # average over batch and patch
+    cross_sim_4d = sim.mean(axis=(-1, -2))
+
+    # flatten for big heatmap
+    cross_sim_2d = rearrange(cross_sim_4d, 't l t2 l2 -> (t l) (t2 l2)')
+
+Nếu không có rearrange thì reshape / transpose thủ công theo cùng logic.
+
+------------------------------------------------------------------
+7) Visualization nên sinh ra những gì
+------------------------------------------------------------------
+
+Figure 1. Grid T x T của các heatmap [L, L]
+-------------------------------------------
+Khuyến nghị đây là output chính.
+
+Ví dụ T = 10, L = 27:
+- 100 heatmap con
+- tổ chức thành lưới 10 x 10
+- mỗi ô con là 27 x 27
+
+Trục:
+- trục lớn theo hàng: timestep nguồn
+- trục lớn theo cột: timestep đích
+- trục nhỏ bên trong mỗi ô: block index 1..27
+
+Figure 2. Heatmap lớn [(T*L), (T*L)]
+------------------------------------
+Ví dụ:
+- 270 x 270
+
+Nên kẻ line phân tách sau mỗi 27 block để nhìn rõ ranh giới timestep.
+
+Figure 3. Một số heatmap con chọn lọc
+-------------------------------------
+Ví dụ log riêng các cặp:
+- (t1, t1)
+- (t1, t5)
+- (t1, t10)
+- (t5, t10)
+- (t10, t10)
+
+để dễ zoom-in trong W&B.
+
+------------------------------------------------------------------
+8) Cách đọc pattern từ heatmap mới
+------------------------------------------------------------------
+
+Heatmap cũ chỉ trả lời:
+- trong cùng timestep, block nào giống nhau?
+
+Heatmap mới trả lời thêm:
+- block nào ổn định theo thời gian?
+- representation thay đổi mạnh nhất ở giai đoạn timestep nào?
+- late block ở timestep sớm có giống early block ở timestep muộn không?
+- có xuất hiện trajectory coarse-to-fine dọc theo cả depth và timestep không?
+
+Một vài pattern đáng chú ý:
+- Các ô chéo theo timestep C[k, :, k, :] cho thấy cấu trúc nội bộ trong từng timestep.
+- Các ô ngoài chéo C[k, :, k', :] cho thấy mức dịch chuyển representation giữa hai timestep.
+- Nếu các ô gần đường chéo timestep sáng hơn các ô xa đường chéo timestep, điều đó gợi ý representation thay đổi dần dần theo thời gian.
+- Nếu một số late block giữ similarity cao với nhiều timestep khác nhau, có thể chúng ổn định hơn về semantic structure.
+
+------------------------------------------------------------------
+9) CFG cần xử lý như cũ
+------------------------------------------------------------------
+
+Nếu inference dùng classifier-free guidance:
+- batch thường bị nhân đôi
+- hidden token của cond/uncond bị gộp chung trong batch dimension
+
+Không được tính similarity trực tiếp trên batch đã nhân đôi nếu chưa tách nhánh.
+
+Khuyến nghị:
+- chỉ phân tích cond branch
+hoặc
+- phân tích cond và uncond riêng
+
+Nhưng không trộn hai nhánh với nhau.
+
+------------------------------------------------------------------
+10) Khuyến nghị log trên W&B
+------------------------------------------------------------------
+
+Nên log:
+
+1. Raw tensor hoặc file numpy/pickle
+- cross_sim_4d: [T, L, T, L]
+
+2. Hình grid T x T
+- figure chính để phân tích
+
+3. Heatmap lớn [T*L, T*L]
+- figure tổng quan
+
+4. Một số heatmap con được chọn
+- để zoom dễ hơn
+
+5. Metadata đi kèm
+- model size (DiT-XL)
+- số block L
+- danh sách timestep được chọn
+- sampling steps tổng
+- cond/uncond branch nào được dùng
+- batch size thực sự dùng để tính similarity
+
+------------------------------------------------------------------
+11) Khuyến nghị chọn timestep để đo
+------------------------------------------------------------------
+
+Không nhất thiết phải log mọi timestep sampling nếu quá tốn chi phí.
+
+Có thể chọn một tập timestep cố định, ví dụ:
+- t = 1, 4, 8, 16, 32, 48, 64, 80, 96, 127
+
+hoặc theo lịch bạn đang dùng.
+
+Điểm quan trọng:
+- T là số timestep được chọn để PHÂN TÍCH, không nhất thiết bằng toàn bộ số bước sampling.
+- Nếu chọn T = 10, output flatten sẽ là 270 x 270 với DiT-XL.
+
+------------------------------------------------------------------
+12) Tóm tắt ngắn gọn phần thay đổi
+------------------------------------------------------------------
+
+Từ setting cũ:
+
+    output_old = [T, L, L]
+
+sang setting mới:
+
+    output_new = [T, L, T, L]
+
+và khi flatten:
+
+    output_new_flat = [T*L, T*L]
+
+Với DiT-XL và 10 timestep:
+
+    [10, 27, 27]  ->  [10, 27, 10, 27]  ->  [270, 270]
+
+Về mặt visualize:
+- trước đây: 10 heatmap 27 x 27
+- bây giờ: 100 heatmap con 27 x 27 sắp thành lưới 10 x 10
+- hoặc 1 heatmap lớn 270 x 270
+
+Mở rộng này cho phép phân tích đồng thời:
+- quan hệ giữa các block trong cùng timestep
+- quan hệ giữa các block ở những timestep khác nhau
+- quỹ đạo thay đổi representation theo cả depth và diffusion time
+
