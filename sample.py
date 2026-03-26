@@ -457,10 +457,6 @@ def save_pca_metrics(pca_results):
     # Type C: trajectory  →  trajectory_pca_metrics.npz
     traj_PR    = np.array([r[0]['PR']   if r[0] else 0.0 for r in pca_results['traj']])
     traj_top1  = np.array([r[0]['top1'] if r[0] else 0.0 for r in pca_results['traj']])
-    traj_evr   = np.array([r[0]['evr']  if r[0] else np.zeros(1) for r in pca_results['traj']],
-                          dtype=object)
-    # traj_proj[l]: [B, T, n_pc]  – stack along block axis if uniform shape
-    traj_projs = [r[1] for r in pca_results['traj'] if r[1] is not None]
     path_lens   = np.array([r[2]['path_length'].mean()    if r[2] else 0.0
                             for r in pca_results['traj']])
     se_dists    = np.array([r[2]['start_end_dist'].mean() if r[2] else 0.0
@@ -553,7 +549,7 @@ def visualize_pca_results(pca_results):
     sel_blocks = sorted({0, L // 4, L // 2, 3 * L // 4, L - 1})
     cmap_ts = plt.cm.plasma
     for li in sel_blocks:
-        traj_m, traj_p, motion = pca_results['traj'][li]
+        traj_m, traj_p, _ = pca_results['traj'][li]
         if traj_p is None:
             continue
         B_vis = traj_p.shape[0]
@@ -703,6 +699,219 @@ def visualize_pca_results(pca_results):
     print("  Saved image_pca_scatter.png")
 
 
+##############################################################################
+#  Layer-wise Cross-Noise Patch-wise Cosine Similarity
+#  Spec: Layer-wise Cross-Noise Patch-wise Cosine
+##############################################################################
+
+def compute_layer_cross_similarity(cross_sim_4d):
+    """
+    Derive layer-major cross-noise similarity from existing cross_sim_4d [T, L, T, L].
+
+    The underlying similarity values are identical to cross_sim_4d — this is a
+    pure axis-reorder + reshape.
+
+    Indexing:
+        cross_sim_4d    [T, L, T, L]  – timestep-major (C[t, l, t', l'])
+        layer_cross_4d  [L, T, L, T]  – layer-major    (S[l, t, l', t'])
+
+    Layer-major flatten (spec): row/col index = l * T + t
+        → block (l, l') of the [L*T, L*T] matrix is T×T
+        → diagonal block (l, l) shows how layer l evolves across noise levels
+
+    Returns:
+        layer_cross_4d : numpy [L, T, L, T]
+        layer_cross_2d : numpy [L*T, L*T]   layer-major flattened
+    """
+    # cross_sim_4d axes: (t, l, t', l')  →  transpose to (l, t, l', t')
+    layer_cross_4d = cross_sim_4d.transpose(1, 0, 3, 2)          # [L, T, L, T]
+    L, T = layer_cross_4d.shape[0], layer_cross_4d.shape[1]
+    layer_cross_2d = layer_cross_4d.reshape(L * T, L * T)        # [L*T, L*T]
+    return layer_cross_4d, layer_cross_2d
+
+
+def visualize_layer_cross_similarity(layer_cross_4d, layer_cross_2d, tracked,
+                                     save_prefix='layer_cross'):
+    """
+    Produce visualizations for layer-wise cross-noise patch cosine similarity.
+
+    Outputs:
+        {save_prefix}_heatmap_full.png      – [L*T, L*T] heatmap, layer-major blocks
+        {save_prefix}_diagonal_blocks.png   – diagonal T×T blocks: noise stability per layer
+    """
+    L, T = layer_cross_4d.shape[0], layer_cross_4d.shape[1]
+    t_labels = [str(t) for t in tracked]
+
+    # ── 1. Full [L*T, L*T] heatmap ───────────────────────────────────────────
+    vmin = float(np.percentile(layer_cross_2d, 2))
+    vmax = float(np.percentile(layer_cross_2d, 98))
+    fig_sz = max(10, min(20, L * T // 10))
+    fig, ax = plt.subplots(figsize=(fig_sz, fig_sz))
+    im = ax.imshow(layer_cross_2d, cmap='viridis', vmin=vmin, vmax=vmax,
+                   aspect='auto', interpolation='nearest')
+    plt.colorbar(im, ax=ax, shrink=0.6, label='Cosine similarity')
+
+    # Draw separator lines every T rows/cols to highlight L×L block structure
+    for i in range(1, L):
+        ax.axhline(i * T - 0.5, color='white', linewidth=0.4, alpha=0.6)
+        ax.axvline(i * T - 0.5, color='white', linewidth=0.4, alpha=0.6)
+
+    # Axis ticks: one per block (layer index)
+    tick_pos = [l * T + T // 2 for l in range(L)]
+    step = max(1, L // 14)
+    shown = [l for l in range(L) if l % step == 0]
+    ax.set_xticks([tick_pos[l] for l in shown])
+    ax.set_xticklabels([f'L{l}' for l in shown], fontsize=7, rotation=45)
+    ax.set_yticks([tick_pos[l] for l in shown])
+    ax.set_yticklabels([f'L{l}' for l in shown], fontsize=7)
+    ax.set_title(f'Layer-wise Cross-Noise Patch Cosine Similarity  [{L*T}×{L*T}]\n'
+                 f'(layer-major: each {T}×{T} block = one layer pair across noise levels)',
+                 fontsize=10)
+    plt.tight_layout()
+    fname1 = f'{save_prefix}_heatmap_full.png'
+    fig.savefig(fname1, dpi=120, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
+    print(f"  Saved {fname1}")
+
+    # ── 2. Diagonal T×T blocks: noise stability per selected layer ────────────
+    sel = sorted({0, L // 4, L // 2, 3 * L // 4, L - 1})
+    n_sel = len(sel)
+    fig, axes = plt.subplots(1, n_sel, figsize=(3.5 * n_sel, 3.5), squeeze=False)
+    for col, li in enumerate(sel):
+        # S[l, :, l, :] in R^{T × T}: similarity of layer li with itself across noise pairs
+        block = layer_cross_4d[li, :, li, :]   # [T, T]
+        ax = axes[0, col]
+        sns.heatmap(block, ax=ax, cmap='viridis',
+                    vmin=float(block.min()), vmax=1.0,
+                    xticklabels=t_labels, yticklabels=t_labels, annot=(T <= 12),
+                    fmt='.2f' if T <= 12 else '')
+        ax.set_title(f'Layer {li}\n(noise × noise)', fontsize=9)
+        ax.set_xlabel('Noise level t\'', fontsize=8)
+        if col == 0:
+            ax.set_ylabel('Noise level t', fontsize=8)
+        ax.tick_params(axis='x', labelsize=7, rotation=45)
+        ax.tick_params(axis='y', labelsize=7)
+    fig.suptitle('Diagonal blocks S[l,:,l,:] – noise-level stability per layer\n'
+                 '(high off-diagonal = layer is stable across noise levels)', fontsize=10)
+    plt.tight_layout()
+    fname2 = f'{save_prefix}_diagonal_blocks.png'
+    fig.savefig(fname2, dpi=120, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
+    print(f"  Saved {fname2}")
+
+
+##############################################################################
+#  REPA-style PCA feature map visualization
+#  Spec: repa_pca_visualization_only_spec.txt
+##############################################################################
+
+def pca_feature_map(tokens, gh, gw, eps=1e-8, robust=True):
+    """
+    Per-panel PCA feature map – Mode A (spec recommended default).
+
+    For one (image, timestep, layer):
+      1. center tokens: Xc = tokens - mean(tokens, axis=0)
+      2. SVD → top-3 principal directions
+      3. project:  Y = Xc @ V3        [N, 3]
+      4. reshape:  Y_grid [gh, gw, 3]
+      5. normalize each channel to [0, 1] via 1/99 percentile clip (robust)
+
+    tokens : numpy [N, D]  – spatial patch tokens for one image
+    Returns: numpy [gh, gw, 3]  float32 in [0, 1] – RGB feature map panel
+    """
+    Xc = tokens - tokens.mean(axis=0, keepdims=True)
+    _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+    V3 = Vt[:3].T                       # [D, 3]
+    Y  = (Xc @ V3).reshape(gh, gw, 3)  # [gh, gw, 3]
+    for c in range(3):
+        yc = Y[:, :, c]
+        lo = np.percentile(yc, 1)  if robust else yc.min()
+        hi = np.percentile(yc, 99) if robust else yc.max()
+        Y[:, :, c] = (yc - lo) / (hi - lo + eps)
+    return np.clip(Y, 0, 1).astype(np.float32)
+
+
+def visualize_repa_pca(
+    models_data,
+    tracked_steps,
+    image_b=0,
+    sel_layers=None,
+    upsample_factor=8,
+    out_prefix='repa_pca',
+):
+    """
+    REPA-style PCA feature map grid (spec: repa_pca_visualization_only_spec.txt).
+
+    Produces one PNG per tracked timestep:  {out_prefix}_t{t}.png
+
+    Layout per figure:
+        - rows    = models  (one row per entry in models_data)
+        - columns = selected layers
+        - each cell = RGB PCA feature map for that (model, layer) at timestep t
+
+    Parameters
+    ----------
+    models_data   : list of (name: str, block_tokens_per_timestep: dict)
+                    dict maps t_val -> list[L] of tensor [B, N, D]
+    tracked_steps : ordered list of t values to visualize
+    image_b       : index of image in batch to visualize (default 0)
+    sel_layers    : 0-indexed layer indices; auto-selected sparse subset if None
+                    (early + middle + late, matching REPA figure style)
+    upsample_factor : nearest-neighbour upsampling for display
+                      (default 8: 16×16 patch grid → 128×128 pixels)
+    out_prefix    : filename prefix (default 'repa_pca')
+    """
+    all_btps = [btp for _, btp in models_data]
+    tracked  = [t for t in tracked_steps if all(t in btp for btp in all_btps)]
+    if not tracked:
+        print("visualize_repa_pca: no tracked timesteps found in any model.")
+        return
+
+    L = len(all_btps[0][tracked[0]])
+
+    # Sparse layer subset: early (0-6) + a mid point + late  (spec section "Which layers")
+    if sel_layers is None:
+        early = list(range(min(7, L)))
+        mid   = [L // 2 - 1]
+        late  = sorted({3 * L // 4 - 1, L - 2, L - 1})
+        sel_layers = sorted(set(early + mid + late) & set(range(L)))
+
+    n_rows = len(models_data)
+    n_cols = len(sel_layers)
+
+    for t in tracked:
+        fig, axes = plt.subplots(n_rows, n_cols,
+                                 figsize=(n_cols * 1.6, n_rows * 1.9),
+                                 squeeze=False)
+        fig.suptitle(f't = {t}', fontsize=11, y=1.02)
+
+        for row, (model_name, btp) in enumerate(models_data):
+            block_list = btp[t]  # list[L] of tensor [B, N, D]
+            for col, li in enumerate(sel_layers):
+                tokens = block_list[li][image_b].cpu().numpy()  # [N, D]
+                N, D   = tokens.shape
+                Gh = Gw = int(round(N ** 0.5))
+                panel  = pca_feature_map(tokens, Gh, Gw)       # [Gh, Gw, 3]
+                if upsample_factor > 1:
+                    panel = panel.repeat(upsample_factor, axis=0) \
+                                 .repeat(upsample_factor, axis=1)
+                ax = axes[row, col]
+                ax.imshow(panel, interpolation='nearest')
+                ax.axis('off')
+                if row == 0:
+                    ax.set_title(f'L{li}', fontsize=8)
+            axes[row, 0].set_ylabel(model_name, fontsize=9)
+
+        plt.tight_layout()
+        fname = f'{out_prefix}_t{t}.png'
+        fig.savefig(fname, dpi=120, bbox_inches='tight')
+        plt.show()
+        plt.close(fig)
+        print(f"  Saved {fname}")
+
+
 def main(args):
     # Setup PyTorch:
     torch.manual_seed(args.seed)
@@ -742,8 +951,8 @@ def main(args):
     y = torch.cat([y, y_null], 0)
     model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
 
-    # need_tracking when --track-similarity OR --run-pca
-    need_tracking = args.track_similarity or args.run_pca
+    # need_tracking when any analysis option is enabled
+    need_tracking = args.track_similarity or args.run_pca or args.repa_pca
 
     # Sample images:
     if need_tracking:
@@ -783,6 +992,25 @@ def main(args):
         visualize_cross_timestep_similarity(cross_sim_4d, cross_sim_2d, tracked,
                                             save_prefix="cross_sim")
 
+        # Layer-wise cross-noise (layer-major reorder of the same data)
+        print("\nComputing layer-wise cross-noise similarity...")
+        layer_cross_4d, layer_cross_2d = compute_layer_cross_similarity(cross_sim_4d)
+        np.save("layer_cross_4d.npy", layer_cross_4d)
+        np.save("layer_cross_2d.npy", layer_cross_2d)
+        print(f"  layer_cross_4d: {layer_cross_4d.shape}   layer_cross_2d: {layer_cross_2d.shape}")
+        visualize_layer_cross_similarity(layer_cross_4d, layer_cross_2d, tracked,
+                                         save_prefix="layer_cross")
+
+    # ── REPA-style PCA feature map visualization ──────────────────────────
+    if args.repa_pca and need_tracking:
+        print("\nGenerating REPA-style PCA feature maps...")
+        visualize_repa_pca(
+            models_data=[('DiT', wrapper.block_tokens_per_timestep)],
+            tracked_steps=args.track_timesteps,
+            image_b=0,
+            out_prefix='repa_pca',
+        )
+
     # ── PCA analysis ──────────────────────────────────────────────────────
     if args.run_pca and need_tracking:
         print("\nRunning PCA analysis (token-wise, image-wise, trajectory)...")
@@ -790,12 +1018,9 @@ def main(args):
             wrapper.block_tokens_per_timestep, args.track_timesteps
         )
         if pca_results:
-            save_pca_metrics(pca_results, prefix='pca')
-            visualize_pca_results(pca_results, save_prefix='pca')
-            L_pca, T_pca = pca_results['L'], pca_results['T']
-            print(f"\nPCA analysis complete: {L_pca} blocks × {T_pca} timesteps")
-            print("Saved: pca_token_pca_metrics.npz, pca_image_pca_metrics.npz, "
-                  "pca_traj_pca_metrics.npz")
+            save_pca_metrics(pca_results)
+            visualize_pca_results(pca_results)
+            print(f"\nPCA analysis complete: {pca_results['L']} blocks × {pca_results['T']} timesteps")
 
 
 if __name__ == "__main__":
@@ -815,6 +1040,8 @@ if __name__ == "__main__":
                         help="Enable cross-timestep block cosine similarity tracking")
     parser.add_argument("--run-pca", action="store_true",
                         help="Run token-wise, image-wise, and trajectory PCA on block tokens")
+    parser.add_argument("--repa-pca", action="store_true",
+                        help="Generate REPA-style PCA RGB feature map panels per (timestep, layer)")
     parser.add_argument("--n-track-levels", type=int, default=10,
                         help="Number of evenly-spaced noise levels to track (default: 10). "
                              "Levels are auto-selected from the actual sampling schedule to "
