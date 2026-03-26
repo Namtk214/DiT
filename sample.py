@@ -942,6 +942,93 @@ def visualize_repa_pca(
         print(f"  Saved {fname}")
 
 
+def visualize_repa_pca_matrix(
+    models_data,
+    tracked_steps,
+    image_b=0,
+    upsample_factor=4,
+    out_prefix='repa_pca_matrix',
+    input_image=None,
+    t_to_label=None,
+):
+    """
+    Full (T × L) matrix figure: rows = noise levels, columns = ALL blocks.
+    One PNG per model: {out_prefix}_{model_name}.png
+
+    Unlike visualize_repa_pca (which shows sparse layers, one fig per timestep),
+    this shows every block and every noise level in a single combined figure.
+
+    upsample_factor : recommend 4 (16×16 → 64×64 per panel) so all L columns fit
+    input_image     : optional numpy [H, W, 3] in [0, 1] – extra column on the left
+    """
+    all_btps = [btp for _, btp in models_data]
+    tracked  = [t for t in tracked_steps if all(t in btp for btp in all_btps)]
+    if not tracked:
+        print("visualize_repa_pca_matrix: no tracked timesteps found.")
+        return
+
+    L        = len(all_btps[0][tracked[0]])
+    T        = len(tracked)
+    has_img  = input_image is not None
+    n_cols   = L + (1 if has_img else 0)
+
+    sample_n = all_btps[0][tracked[0]][0][image_b].shape[0]
+    panel_px = int(round(sample_n ** 0.5)) * upsample_factor
+    cell_in  = panel_px / 100   # inches per panel at 100 dpi
+
+    for model_name, btp in models_data:
+        fig, axes = plt.subplots(
+            T, n_cols,
+            figsize=(n_cols * cell_in + 1.2, T * cell_in + 0.4),
+            squeeze=False
+        )
+        fig.suptitle(
+            f'{model_name} – PCA feature maps\n'
+            f'rows = noise levels (σ-uniform)   |   cols = all {L} blocks',
+            fontsize=9, y=1.01
+        )
+
+        for row, t in enumerate(tracked):
+            t_lbl      = _fmt_t(t, t_to_label)
+            col_offset = 0
+
+            # optional input image (leftmost column, same for all rows)
+            if has_img:
+                img_disp = _resize_nearest(input_image, panel_px, panel_px)
+                axes[row, 0].imshow(img_disp, interpolation='bilinear')
+                axes[row, 0].axis('off')
+                if row == 0:
+                    axes[row, 0].set_title('Input', fontsize=6)
+                col_offset = 1
+
+            # row label on first PCA column
+            axes[row, col_offset].set_ylabel(t_lbl, fontsize=7,
+                                             rotation=0, ha='right',
+                                             va='center', labelpad=2)
+
+            block_list = btp[t]
+            for li in range(L):
+                tokens = block_list[li][image_b].cpu().numpy()  # [N, D]
+                n_tok  = tokens.shape[0]
+                gh = gw = int(round(n_tok ** 0.5))
+                panel  = pca_feature_map(tokens, gh, gw)
+                if upsample_factor > 1:
+                    panel = panel.repeat(upsample_factor, axis=0) \
+                                 .repeat(upsample_factor, axis=1)
+                ax = axes[row, col_offset + li]
+                ax.imshow(panel, interpolation='nearest')
+                ax.axis('off')
+                if row == 0:
+                    ax.set_title(f'L{li}', fontsize=6)
+
+        plt.subplots_adjust(wspace=0.02, hspace=0.02)
+        fname = f'{out_prefix}_{model_name}.png'
+        fig.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.show()
+        plt.close(fig)
+        print(f"  Saved {fname}")
+
+
 def main(args):
     # Setup PyTorch:
     torch.manual_seed(args.seed)
@@ -1055,12 +1142,25 @@ def main(args):
 
     # ── REPA-style PCA feature map visualization ──────────────────────────
     if args.repa_pca and need_tracking:
-        print("\nGenerating REPA-style PCA feature maps...")
+        _models = [('DiT', wrapper.block_tokens_per_timestep)]
+        # Full T×L matrix (all blocks × all noise levels in one figure)
+        print("\nGenerating full T×L PCA matrix (all blocks × noise levels)...")
+        visualize_repa_pca_matrix(
+            models_data=_models,
+            tracked_steps=args.track_timesteps,
+            image_b=0,
+            upsample_factor=4,
+            out_prefix='repa_pca_matrix',
+            t_to_label=t_to_label,
+        )
+        # Per-timestep figures with sparse layers (larger panels)
+        print("\nGenerating per-timestep PCA panels (sparse layers)...")
         visualize_repa_pca(
-            models_data=[('DiT', wrapper.block_tokens_per_timestep)],
+            models_data=_models,
             tracked_steps=args.track_timesteps,
             image_b=0,
             out_prefix='repa_pca',
+            t_to_label=t_to_label,
         )
 
     # ── PCA analysis ──────────────────────────────────────────────────────
