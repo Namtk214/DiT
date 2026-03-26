@@ -45,30 +45,42 @@ def compute_cross_timestep_similarity(block_tokens_per_timestep, tracked_steps):
     T = len(tracked)
 
     # Stack into H: [T, L, B, N, D]
-    H_list = []
-    for t in tracked:
-        tokens = block_tokens_per_timestep[t]   # list of L tensors, each (B, N, D)
-        H_list.append(torch.stack(tokens, dim=0))   # [L, B, N, D]
-    H = torch.stack(H_list, dim=0)   # [T, L, B, N, D]
-    T, L, _, _, _ = H.shape
+    H = torch.stack(
+        [torch.stack(block_tokens_per_timestep[t], dim=0) for t in tracked],
+        dim=0
+    )   # [T, L, B, N, D]
+    T, L, B, N, D = H.shape
+    BN = B * N
 
-    # Normalize along hidden dimension
+    # Normalize along hidden dimension; free H immediately after
     h_norm = H / (torch.linalg.norm(H, dim=-1, keepdim=True) + 1e-8)
+    del H
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    # Broadcast pairwise over (T, L) x (T, L):
-    #   h_norm[:, :, None, None, ...]  shape [T, L, 1, 1, B, N, D]
-    # * h_norm[None, None, :, :, ...]  shape [1, 1, T, L, B, N, D]
-    # dot-product over D -> [T, L, T, L, B, N]
-    sim = (h_norm[:, :, None, None, :, :, :] * h_norm[None, None, :, :, :, :, :]).sum(dim=-1)
+    # Reshape to [T, L, B*N*D] for memory-efficient pairwise matmul.
+    # No new allocation: view shares storage with h_norm.
+    h_flat = h_norm.view(T, L, BN * D)   # [T, L, BN*D]
 
-    # Average over batch and patch dimensions -> [T, L, T, L]
-    cross_sim_4d = sim.mean(dim=(-2, -1))
+    # Compute cross_sim_2d [(T*L) x (T*L)] iteratively over timestep pairs.
+    # For pair (k1, k2):
+    #   sim[k1, l1, k2, l2] = (1/BN) * sum_{b,n,d} h[k1,l1,b,n,d] * h[k2,l2,b,n,d]
+    #                        = ([L, BN*D] @ [BN*D, L])[l1, l2] / BN
+    # Each matmul: [L, BN*D] @ [BN*D, L] -> [L, L]  (no large intermediate)
+    cross_sim_2d = torch.zeros(T * L, T * L, dtype=torch.float32, device='cpu')
+    for k1 in tqdm(range(T), desc="Cross-sim (rows)", leave=False):
+        x1 = h_flat[k1].reshape(L, BN * D)   # view [L, BN*D]
+        for k2 in range(T):
+            x2 = h_flat[k2].reshape(L, BN * D)
+            blk = (x1 @ x2.T).to(torch.float32) / BN   # [L, L]
+            cross_sim_2d[k1*L:(k1+1)*L, k2*L:(k2+1)*L] = blk.cpu()
 
-    # Flatten (T, L) x (T, L) -> (T*L) x (T*L)
-    # cross_sim_2d[k*L+a, k'*L+b] = cross_sim_4d[k, a, k', b]
-    cross_sim_2d = cross_sim_4d.reshape(T * L, T * L)
+    del h_flat, h_norm
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    return cross_sim_4d.cpu().numpy(), cross_sim_2d.cpu().numpy(), tracked
+    cross_sim_4d = cross_sim_2d.numpy().reshape(T, L, T, L)
+    return cross_sim_4d, cross_sim_2d.numpy(), tracked
 
 
 class ModelWrapper:
