@@ -1075,19 +1075,23 @@ def main(args):
     # σ_t = sqrt(1 − ᾱ_t).  Uniform spacing in σ gives visually uniform columns
     # in heatmaps instead of uniform spacing in raw timestep indices.
     if args.track_timesteps is None:
-        _tmap = list(diffusion.timestep_map)
-        _ac   = diffusion.alphas_cumprod          # numpy [1000]
-        _sigmas = np.sqrt(1.0 - _ac[_tmap])      # σ for each step in schedule
+        # timestep_map[i] = original DDPM t value at spaced position i
+        # alphas_cumprod[i] = ᾱ at spaced position i  (size = num_sampling_steps)
+        _tmap    = list(diffusion.timestep_map)
+        _ac_arr  = np.array(diffusion.alphas_cumprod)   # [num_sampling_steps]
+        _sigmas  = np.sqrt(1.0 - _ac_arr)               # index by position, not by t
         _targets = np.linspace(_sigmas.min(), _sigmas.max(), args.n_track_levels)
-        _picked = []
+        _picked  = []
         for _ts in _targets:
             _picked.append(int(_tmap[int(np.argmin(np.abs(_sigmas - _ts)))]))
         args.track_timesteps = sorted(set(_picked))
 
     # Build label dict: σ=0.XX for every tracked t
-    _ac = diffusion.alphas_cumprod
-    t_to_label = {t: f'σ={float(np.sqrt(1 - _ac[t])):.2f}'
-                  for t in args.track_timesteps}
+    _tmap_full  = list(diffusion.timestep_map)
+    _ac_arr     = np.array(diffusion.alphas_cumprod)
+    _t_to_pos   = {int(_tmap_full[i]): i for i in range(len(_tmap_full))}
+    t_to_label  = {t: f'σ={float(np.sqrt(1 - _ac_arr[_t_to_pos[t]])):.2f}'
+                   for t in args.track_timesteps if t in _t_to_pos}
     print(f"Tracking {len(args.track_timesteps)} noise levels (σ-uniform):")
     for t in args.track_timesteps:
         print(f"  t={t:4d}  {t_to_label[t]}")
