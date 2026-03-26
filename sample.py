@@ -226,69 +226,148 @@ def visualize_cross_timestep_similarity(cross_sim_4d, cross_sim_2d, tracked_time
 
 ##############################################################################
 #  PCA Analysis  (Token-wise, Image-wise, Timestep-trajectory)
+#  Follows: dit_pca_measurement_spec.txt
 ##############################################################################
 
 def _run_pca(X):
     """
-    PCA on matrix X [M, F].
-    Returns dict: evr, cum_evr, PR, top1, top5, top10, n80/90/95, components.
+    PCA on centered matrix X [M, F].
+    Preprocessing: center by feature (no standardization).
+    Backend: SVD (never explicitly forms covariance matrix).
+
+    Returns dict with all metrics specified in section 2.4 of the spec:
+        S         : singular values
+        lambdas   : eigenvalues  = S^2 / (M-1)
+        evr       : explained variance ratio  r_i
+        cum_evr   : cumulative explained variance  c_k
+        PR        : participation ratio  = (sum lambda)^2 / sum(lambda^2)
+        top1      : r_1   (top1_ratio)
+        top5      : c_5   (top5_cum)
+        top10     : c_10  (top10_cum)
+        n80/90/95 : components needed to reach 80/90/95% variance
+        components: right singular vectors Vt  [K, F]  (principal axes)
+        mean      : feature mean used for centering
     """
-    M, F = X.shape
+    M = X.shape[0]
     if M < 2:
         return None
-    X_c = X - X.mean(axis=0, keepdims=True)
-    U, S, Vt = np.linalg.svd(X_c, full_matrices=False)
+    mean = X.mean(axis=0, keepdims=True)
+    xc = X - mean
+    _, S, Vt = np.linalg.svd(xc, full_matrices=False)
     lambdas = S ** 2 / max(M - 1, 1)
-    total = lambdas.sum() + 1e-12
-    evr = lambdas / total
+    total   = lambdas.sum() + 1e-12
+    evr     = lambdas / total
     cum_evr = np.cumsum(evr)
-    PR = float(total ** 2 / (lambdas ** 2).sum())
-    K = len(evr)
-    top1  = float(evr[0])
-    top5  = float(cum_evr[min(4,  K - 1)])
-    top10 = float(cum_evr[min(9,  K - 1)])
-    n80 = int(np.searchsorted(cum_evr, 0.80)) + 1
-    n90 = int(np.searchsorted(cum_evr, 0.90)) + 1
-    n95 = int(np.searchsorted(cum_evr, 0.95)) + 1
-    return dict(evr=evr, cum_evr=cum_evr, PR=PR,
-                top1=top1, top5=top5, top10=top10,
-                n80=n80, n90=n90, n95=n95,
-                components=Vt)   # Vt: [K, F]
+    PR      = float(total ** 2 / (lambdas ** 2).sum())
+    K       = len(evr)
+    return dict(
+        S=S, lambdas=lambdas,
+        evr=evr, cum_evr=cum_evr,
+        PR=PR,
+        top1 =float(evr[0]),
+        top5 =float(cum_evr[min(4,  K-1)]),
+        top10=float(cum_evr[min(9,  K-1)]),
+        n80=int(np.searchsorted(cum_evr, 0.80)) + 1,
+        n90=int(np.searchsorted(cum_evr, 0.90)) + 1,
+        n95=int(np.searchsorted(cum_evr, 0.95)) + 1,
+        components=Vt,          # [K, F]  principal axes
+        mean=mean.squeeze(0),   # [F]
+    )
 
 
 def compute_token_pca(H):
-    """Token-wise PCA.  H: numpy [B, N, D]  ->  PCA on [B*N, D]."""
+    """
+    PCA type A – Token-wise (spec section 3).
+    H: numpy [B, N, D]
+    Reshape to [B*N, D] then run PCA in channel space D.
+    Returns PCA metrics dict.
+    """
     B, N, D = H.shape
-    return _run_pca(H.reshape(B * N, D).astype(np.float32))
+    X = H.reshape(B * N, D).astype(np.float32)
+    result = _run_pca(X)
+    if result is not None:
+        # optional: keep 2D projection onto PC1-PC2 for scatter (spec 3.6.C)
+        n_pc = min(2, len(result['evr']))
+        result['proj2d'] = (X - result['mean']) @ result['components'][:n_pc].T  # [B*N, 2]
+        result['proj2d_shape'] = (B, N)   # original shape before flatten
+    return result
 
 
 def compute_image_pca(H):
-    """Image-wise PCA (mean-pool tokens).  H: numpy [B, N, D]  ->  PCA on [B, D]."""
-    return _run_pca(H.mean(axis=1).astype(np.float32))
-
-
-def compute_trajectory_pca(H_over_t):
     """
-    Timestep-trajectory PCA (shared basis).
-    H_over_t: list of T numpy arrays, each [B, N, D]
+    PCA type B – Image-wise (spec section 4).
+    H: numpy [B, N, D]
+    Pool tokens by mean -> [B, D], then run PCA.
+    Returns PCA metrics dict + proj_img [B, 2].
+    """
+    Z = H.mean(axis=1).astype(np.float32)   # [B, D]
+    result = _run_pca(Z)
+    if result is not None:
+        n_pc = min(2, len(result['evr']))
+        result['proj_img'] = (Z - result['mean']) @ result['components'][:n_pc].T  # [B, 2]
+    return result
+
+
+def compute_trajectory_pca(H_over_t, pooling='mean', shared_basis=True):
+    """
+    PCA type C – Timestep-trajectory (spec section 5).
+    H_over_t : list of T numpy [B, N, D]
+    pooling  : 'mean' (mean over tokens, spec default)
+    shared_basis : True = fit one PCA on all (B*T) pooled vectors (spec recommended default)
 
     Returns:
-        pca_result: PCA metrics on stacked [B*T, D]
-        traj_proj:  numpy [B, T, 3]  – first 3 PCs per image per timestep
+        pca_result  : PCA metrics on [B*T, D]
+        traj_proj   : numpy [B, T, 3]  – projected trajectory (first 3 PCs)
+        motion_stats: dict with per-image motion statistics (spec section 5.6)
     """
     T = len(H_over_t)
     B = H_over_t[0].shape[0]
-    Z_list = [H.mean(axis=1).astype(np.float32) for H in H_over_t]  # T x [B, D]
-    Z_all  = np.concatenate(Z_list, axis=0)                          # [B*T, D]
-    pca_result = _run_pca(Z_all)
+
+    # Pool tokens -> [B, D] per timestep  (spec 5.3)
+    z_list = [H.mean(axis=1).astype(np.float32) for H in H_over_t]   # T x [B, D]
+
+    # Shared basis: fit PCA on Z_all [B*T, D]  (spec 5.5)
+    z_all = np.concatenate(z_list, axis=0)   # [B*T, D]
+    pca_result = _run_pca(z_all)
     if pca_result is None:
-        return None, None
-    mean_vec = Z_all.mean(axis=0)
-    n_pc = min(3, len(pca_result['evr']))
-    Vt3  = pca_result['components'][:n_pc]   # [3, D]
-    proj_list = [(Z - mean_vec) @ Vt3.T for Z in Z_list]
-    traj_proj = np.stack(proj_list, axis=1)  # [B, T, 3]
-    return pca_result, traj_proj
+        return None, None, None
+
+    # Project each timestep's Z using the shared mean and top-3 PCs  (spec 5.5)
+    n_pc  = min(3, len(pca_result['evr']))
+    vt_top = pca_result['components'][:n_pc]   # [n_pc, D]
+    mean_vec = pca_result['mean']
+
+    proj_list = [(z - mean_vec) @ vt_top.T for z in z_list]   # T x [B, n_pc]
+    traj_proj = np.stack(proj_list, axis=1)                    # [B, T, n_pc]
+
+    # Motion statistics per image  (spec 5.6)
+    steps      = np.diff(traj_proj, axis=1)                        # [B, T-1, n_pc]
+    step_dists = np.linalg.norm(steps, axis=-1)                    # [B, T-1]
+    path_length    = step_dists.sum(axis=1)                        # [B]
+    avg_step       = step_dists.mean(axis=1)                       # [B]
+    start_end_dist = np.linalg.norm(
+        traj_proj[:, -1, :] - traj_proj[:, 0, :], axis=-1         # [B]
+    )
+    # Curvature proxy: mean turning angle between consecutive segments
+    if T > 2:
+        v1 = steps[:, :-1, :]                                      # [B, T-2, n_pc]
+        v2 = steps[:, 1:,  :]
+        cos_angles = (
+            (v1 * v2).sum(axis=-1)
+            / (np.linalg.norm(v1, axis=-1) * np.linalg.norm(v2, axis=-1) + 1e-8)
+        )
+        curvature = np.arccos(np.clip(cos_angles, -1, 1)).mean(axis=1)  # [B] radians
+    else:
+        curvature = np.zeros(B)
+
+    motion_stats = dict(
+        path_length=path_length,        # [B] total Euclidean path in PCA space
+        start_end_dist=start_end_dist,  # [B] direct distance first→last timestep
+        avg_step=avg_step,              # [B] mean step size
+        curvature=curvature,            # [B] mean turning angle (radians)
+    )
+
+    return pca_result, traj_proj, motion_stats
 
 
 def run_pca_analysis(block_tokens_per_timestep, tracked_steps):
@@ -296,36 +375,34 @@ def run_pca_analysis(block_tokens_per_timestep, tracked_steps):
     Run all three PCA types on collected block tokens.
 
     Returns dict:
-        tracked  : list of collected timesteps (ordered)
-        L, T     : num blocks, num tracked timesteps
-        token    : list[L] of list[T] of metric dicts
-        image    : list[L] of list[T] of metric dicts
-        traj     : list[L] of (pca_result, traj_proj [B, T, 3])
+        tracked : list of tracked timesteps (ordered)
+        L, T    : num blocks, num tracked timesteps
+        token   : list[L] of list[T] of metric dicts  (type A)
+        image   : list[L] of list[T] of metric dicts  (type B)
+        traj    : list[L] of (pca_result, traj_proj[B,T,3], motion_stats)  (type C)
     """
     tracked = [t for t in tracked_steps if t in block_tokens_per_timestep]
     T = len(tracked)
     if T == 0:
         return None
 
-    # Convert to numpy: block_np[ki][li] = [B, N, D]
-    block_np = {}
-    for ki, t in enumerate(tracked):
-        block_np[ki] = [bt.cpu().numpy() for bt in block_tokens_per_timestep[t]]
+    block_np = {ki: [bt.cpu().numpy() for bt in block_tokens_per_timestep[t]]
+                for ki, t in enumerate(tracked)}
     L = len(block_np[0])
 
     token_metrics = [[None] * T for _ in range(L)]
     image_metrics = [[None] * T for _ in range(L)]
 
-    print("Running token-wise and image-wise PCA...")
-    for li in tqdm(range(L), desc="Blocks (token+image PCA)"):
+    print("Running token-wise and image-wise PCA (type A + B)...")
+    for li in tqdm(range(L), desc="Blocks (token+image)"):
         for ki in range(T):
             H = block_np[ki][li]
             token_metrics[li][ki] = compute_token_pca(H)
             image_metrics[li][ki] = compute_image_pca(H)
 
     traj_results = []
-    print("Running timestep-trajectory PCA...")
-    for li in tqdm(range(L), desc="Blocks (trajectory PCA)"):
+    print("Running timestep-trajectory PCA (type C)...")
+    for li in tqdm(range(L), desc="Blocks (trajectory)"):
         H_over_t = [block_np[ki][li] for ki in range(T)]
         traj_results.append(compute_trajectory_pca(H_over_t))
 
@@ -333,7 +410,8 @@ def run_pca_analysis(block_tokens_per_timestep, tracked_steps):
                 token=token_metrics, image=image_metrics, traj=traj_results)
 
 
-def _extract_metric(metrics_2d, key, L, T):
+def _ext(metrics_2d, key, L, T):
+    """Extract a [L, T] metric array from a list-of-lists of dicts."""
     arr = np.zeros((L, T))
     for li in range(L):
         for ki in range(T):
@@ -343,120 +421,286 @@ def _extract_metric(metrics_2d, key, L, T):
     return arr
 
 
-def save_pca_metrics(pca_results, prefix='pca'):
-    """Save summary metrics as .npz files."""
-    L, T = pca_results['L'], pca_results['T']
+def save_pca_metrics(pca_results):
+    """
+    Save PCA metrics to .npz files.
+    Artifact names follow spec section 8:
+        token_pca_metrics.npz
+        image_pca_metrics.npz
+        trajectory_pca_metrics.npz
+    """
+    L, T    = pca_results['L'], pca_results['T']
     tracked = np.array(pca_results['tracked'])
 
-    for tag, metrics in [('token', pca_results['token']), ('image', pca_results['image'])]:
-        np.savez(f'{prefix}_{tag}_pca_metrics.npz',
-                 tracked=tracked,
-                 top1 =_extract_metric(metrics, 'top1',  L, T),
-                 top5 =_extract_metric(metrics, 'top5',  L, T),
-                 top10=_extract_metric(metrics, 'top10', L, T),
-                 PR   =_extract_metric(metrics, 'PR',    L, T),
-                 n80  =_extract_metric(metrics, 'n80',   L, T),
-                 n90  =_extract_metric(metrics, 'n90',   L, T),
-                 n95  =_extract_metric(metrics, 'n95',   L, T))
+    # Type A: token-wise  →  token_pca_metrics.npz
+    np.savez('token_pca_metrics.npz',
+             tracked=tracked,
+             top1 =_ext(pca_results['token'], 'top1',  L, T),
+             top5 =_ext(pca_results['token'], 'top5',  L, T),
+             top10=_ext(pca_results['token'], 'top10', L, T),
+             PR   =_ext(pca_results['token'], 'PR',    L, T),
+             n80  =_ext(pca_results['token'], 'n80',   L, T),
+             n90  =_ext(pca_results['token'], 'n90',   L, T),
+             n95  =_ext(pca_results['token'], 'n95',   L, T))
 
-    traj_PR   = np.array([r[0]['PR']   if r[0] else 0 for r in pca_results['traj']])
-    traj_top1 = np.array([r[0]['top1'] if r[0] else 0 for r in pca_results['traj']])
-    np.savez(f'{prefix}_traj_pca_metrics.npz',
-             tracked=tracked, PR=traj_PR, top1=traj_top1)
+    # Type B: image-wise  →  image_pca_metrics.npz
+    np.savez('image_pca_metrics.npz',
+             tracked=tracked,
+             top1 =_ext(pca_results['image'], 'top1',  L, T),
+             top5 =_ext(pca_results['image'], 'top5',  L, T),
+             top10=_ext(pca_results['image'], 'top10', L, T),
+             PR   =_ext(pca_results['image'], 'PR',    L, T),
+             n80  =_ext(pca_results['image'], 'n80',   L, T),
+             n90  =_ext(pca_results['image'], 'n90',   L, T),
+             n95  =_ext(pca_results['image'], 'n95',   L, T))
 
-    print(f"Saved {prefix}_token_pca_metrics.npz, {prefix}_image_pca_metrics.npz, "
-          f"{prefix}_traj_pca_metrics.npz")
+    # Type C: trajectory  →  trajectory_pca_metrics.npz
+    traj_PR    = np.array([r[0]['PR']   if r[0] else 0.0 for r in pca_results['traj']])
+    traj_top1  = np.array([r[0]['top1'] if r[0] else 0.0 for r in pca_results['traj']])
+    traj_evr   = np.array([r[0]['evr']  if r[0] else np.zeros(1) for r in pca_results['traj']],
+                          dtype=object)
+    # traj_proj[l]: [B, T, n_pc]  – stack along block axis if uniform shape
+    traj_projs = [r[1] for r in pca_results['traj'] if r[1] is not None]
+    path_lens   = np.array([r[2]['path_length'].mean()    if r[2] else 0.0
+                            for r in pca_results['traj']])
+    se_dists    = np.array([r[2]['start_end_dist'].mean() if r[2] else 0.0
+                            for r in pca_results['traj']])
+    avg_steps   = np.array([r[2]['avg_step'].mean()       if r[2] else 0.0
+                            for r in pca_results['traj']])
+    np.savez('trajectory_pca_metrics.npz',
+             tracked=tracked,
+             PR=traj_PR, top1=traj_top1,
+             path_length_mean=path_lens,
+             start_end_dist_mean=se_dists,
+             avg_step_mean=avg_steps)
+
+    print("Saved: token_pca_metrics.npz, image_pca_metrics.npz, trajectory_pca_metrics.npz")
 
 
-def visualize_pca_results(pca_results, save_prefix=None):
+def _heatmap_fig(mat, title, xlabel, ylabel, xlabels, ylabels, fname):
+    """Helper: one heatmap figure saved to fname."""
+    fig, ax = plt.subplots(figsize=(max(6, len(xlabels) * 0.8), max(5, len(ylabels) * 0.25)))
+    sns.heatmap(mat, ax=ax, cmap='viridis', annot=False,
+                xticklabels=xlabels, yticklabels=ylabels)
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    plt.tight_layout()
+    fig.savefig(fname, dpi=100, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
+def visualize_pca_results(pca_results):
     """
-    Produce:
-      Fig 1 – 2×3 heatmaps (token top1/top5/PR, image top1/top5/PR)  over [L × T]
-      Fig 2 – Trajectory plots (PC1 vs PC2) for selected blocks
-      Fig 3 – Scree plots for selected (block, timestep) pairs
+    Produce all minimum figures required by spec section 7.5:
+
+    Spec-named output files:
+        token_pca_heatmap_top1.png   – token top1 variance [L × T]
+        token_pca_heatmap_pr.png     – token PR [L × T]
+        image_pca_heatmap_top1.png   – image top1 variance [L × T]
+        image_pca_heatmap_pr.png     – image PR [L × T]
+        trajectory_block_{l}.png     – per-block trajectory in PC1-PC2 (selected blocks)
+        pca_scree.png                – scree plots for selected (l, t) pairs
+
+    Additional figures (spec sections 3.6, 4.6, 5.7):
+        pca_motion_heatmap.png       – avg path length / start-end dist per block (spec 5.7.C)
+        pca_token_scatter.png        – 2D token scatter PC1-PC2 for selected (l,t) (spec 3.6.C)
+        image_pca_scatter.png        – 2D image scatter PC1-PC2 for selected (l,t) (spec 4.6.B)
     """
     tracked = pca_results['tracked']
     L, T    = pca_results['L'], pca_results['T']
     xlabels = [f't={t}' for t in tracked]
-    step    = max(1, L // 10)
-    ylabels = [f'L{li}' if li % step == 0 else '' for li in range(L)]
+    blk_step = max(1, L // 10)
+    ylabels  = [f'L{li}' if li % blk_step == 0 else '' for li in range(L)]
 
-    # ── Figure 1: heatmaps ────────────────────────────────────────────────
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    panels = [
-        (_extract_metric(pca_results['token'], 'top1', L, T), 'Token-wise: top-1 var ratio', axes[0, 0]),
-        (_extract_metric(pca_results['token'], 'top5', L, T), 'Token-wise: top-5 cum var',   axes[0, 1]),
-        (_extract_metric(pca_results['token'], 'PR',   L, T), 'Token-wise: Participation Ratio', axes[0, 2]),
-        (_extract_metric(pca_results['image'], 'top1', L, T), 'Image-wise: top-1 var ratio', axes[1, 0]),
-        (_extract_metric(pca_results['image'], 'top5', L, T), 'Image-wise: top-5 cum var',   axes[1, 1]),
-        (_extract_metric(pca_results['image'], 'PR',   L, T), 'Image-wise: Participation Ratio', axes[1, 2]),
-    ]
-    for mat, title, ax in panels:
-        sns.heatmap(mat, ax=ax, cmap='viridis', annot=False,
-                    xticklabels=xlabels, yticklabels=ylabels)
-        ax.set_title(title, fontsize=11)
-        ax.set_xlabel('Timestep')
-        ax.set_ylabel('Block')
-    fig.suptitle('PCA Summary: Token-wise (top) and Image-wise (bottom)', fontsize=13)
-    plt.tight_layout()
-    if save_prefix:
-        fig.savefig(f'{save_prefix}_pca_heatmaps.png', dpi=100, bbox_inches='tight')
-        print(f"  Saved {save_prefix}_pca_heatmaps.png")
-    plt.show()
+    # ─────────────────────────────────────────────────────────────────────────
+    # 1. token_pca_heatmap_top1.png  (spec fig 1)
+    # ─────────────────────────────────────────────────────────────────────────
+    _heatmap_fig(_ext(pca_results['token'], 'top1', L, T),
+                 'Token-wise PCA: top-1 explained variance ratio',
+                 'Timestep', 'Block', xlabels, ylabels,
+                 'token_pca_heatmap_top1.png')
 
-    # ── Figure 2: trajectory plots (selected blocks) ──────────────────────
-    sel = sorted({0, L // 4, L // 2, 3 * L // 4, L - 1})
-    fig2, axes2 = plt.subplots(1, len(sel), figsize=(5 * len(sel), 5))
-    if len(sel) == 1:
-        axes2 = [axes2]
-    cmap = plt.cm.plasma
-    for ax, li in zip(axes2, sel):
-        traj_m, traj_p = pca_results['traj'][li]
+    # ─────────────────────────────────────────────────────────────────────────
+    # 2. token_pca_heatmap_pr.png  (spec fig 2)
+    # ─────────────────────────────────────────────────────────────────────────
+    _heatmap_fig(_ext(pca_results['token'], 'PR', L, T),
+                 'Token-wise PCA: Participation Ratio',
+                 'Timestep', 'Block', xlabels, ylabels,
+                 'token_pca_heatmap_pr.png')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 3. image_pca_heatmap_top1.png  (spec fig 3)
+    # ─────────────────────────────────────────────────────────────────────────
+    _heatmap_fig(_ext(pca_results['image'], 'top1', L, T),
+                 'Image-wise PCA: top-1 explained variance ratio',
+                 'Timestep', 'Block', xlabels, ylabels,
+                 'image_pca_heatmap_top1.png')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 4. image_pca_heatmap_pr.png  (spec fig 4)
+    # ─────────────────────────────────────────────────────────────────────────
+    _heatmap_fig(_ext(pca_results['image'], 'PR', L, T),
+                 'Image-wise PCA: Participation Ratio',
+                 'Timestep', 'Block', xlabels, ylabels,
+                 'image_pca_heatmap_pr.png')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 5. trajectory_block_{l}.png  (spec fig 5) – one figure per selected block
+    # ─────────────────────────────────────────────────────────────────────────
+    sel_blocks = sorted({0, L // 4, L // 2, 3 * L // 4, L - 1})
+    cmap_ts = plt.cm.plasma
+    for li in sel_blocks:
+        traj_m, traj_p, motion = pca_results['traj'][li]
         if traj_p is None:
-            ax.set_title(f'Block {li}: no data')
             continue
         B_vis = traj_p.shape[0]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Left: individual trajectories (spec 5.7.A)
+        ax = axes[0]
         for b in range(B_vis):
             xs, ys = traj_p[b, :, 0], traj_p[b, :, 1]
             for ki in range(T - 1):
-                color = cmap(ki / max(T - 1, 1))
-                ax.plot(xs[ki:ki+2], ys[ki:ki+2], '-o', color=color, markersize=4, linewidth=1.5)
-        ax.set_title(f'Block {li}', fontsize=10)
-        ax.set_xlabel('PC1')
-        if li == sel[0]:
-            ax.set_ylabel('PC2')
-    sm = plt.cm.ScalarMappable(cmap=cmap,
-                                norm=plt.Normalize(vmin=tracked[0], vmax=tracked[-1]))
-    sm.set_array([])
-    plt.colorbar(sm, ax=axes2, label='Timestep', shrink=0.6)
-    fig2.suptitle('Timestep-Trajectory PCA – PC1 vs PC2 per Block', fontsize=12)
-    plt.tight_layout()
-    if save_prefix:
-        fig2.savefig(f'{save_prefix}_pca_trajectories.png', dpi=100, bbox_inches='tight')
-        print(f"  Saved {save_prefix}_pca_trajectories.png")
-    plt.show()
+                col = cmap_ts(ki / max(T - 1, 1))
+                ax.plot(xs[ki:ki+2], ys[ki:ki+2], '-o',
+                        color=col, markersize=5, linewidth=1.5, alpha=0.7)
+        sm = plt.cm.ScalarMappable(cmap=cmap_ts,
+                                   norm=plt.Normalize(vmin=tracked[0], vmax=tracked[-1]))
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, label='Timestep', shrink=0.8)
+        ax.set_title(f'Block {li}: individual trajectories', fontsize=11)
+        ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
 
-    # ── Figure 3: scree plots ─────────────────────────────────────────────
-    sel_pairs = [(0, 0), (L // 2, T // 2), (L - 1, T - 1)]
-    fig3, axes3 = plt.subplots(1, len(sel_pairs), figsize=(6 * len(sel_pairs), 4))
-    for ax, (li, ki) in zip(axes3, sel_pairs):
+        # Right: average trajectory (spec 5.7.B)
+        ax2 = axes[1]
+        avg_traj = traj_p.mean(axis=0)   # [T, n_pc]
+        for ki in range(T - 1):
+            col = cmap_ts(ki / max(T - 1, 1))
+            ax2.plot(avg_traj[ki:ki+2, 0], avg_traj[ki:ki+2, 1], '-o',
+                     color=col, markersize=7, linewidth=2)
+        # Label timesteps on average trajectory
+        for ki, t in enumerate(tracked):
+            ax2.annotate(f't={t}', (avg_traj[ki, 0], avg_traj[ki, 1]),
+                         fontsize=7, ha='center', va='bottom')
+        ax2.set_title(f'Block {li}: average trajectory', fontsize=11)
+        ax2.set_xlabel('PC1'); ax2.set_ylabel('PC2')
+
+        evr_str = f"PR={traj_m['PR']:.1f}  top1={traj_m['top1']:.2f}"
+        fig.suptitle(f'Trajectory PCA – Block {li}  ({evr_str})', fontsize=12)
+        plt.tight_layout()
+        fname = f'trajectory_block_{li}.png'
+        fig.savefig(fname, dpi=100, bbox_inches='tight')
+        plt.show()
+        plt.close(fig)
+        print(f"  Saved {fname}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 6. pca_scree.png  (spec fig 6) – selected (block, timestep) pairs
+    # ─────────────────────────────────────────────────────────────────────────
+    sel_pairs = [(0, 0), (L // 4, T // 4), (L // 2, T // 2),
+                 (3 * L // 4, 3 * T // 4), (L - 1, T - 1)]
+    sel_pairs = list(dict.fromkeys(sel_pairs))  # deduplicate preserving order
+    fig, axes = plt.subplots(1, len(sel_pairs), figsize=(5 * len(sel_pairs), 4))
+    if len(sel_pairs) == 1:
+        axes = [axes]
+    for ax, (li, ki) in zip(axes, sel_pairs):
         m = pca_results['token'][li][ki]
         if m is None:
             continue
         n_show = min(30, len(m['evr']))
-        ax.bar(range(1, n_show + 1), m['evr'][:n_show], alpha=0.7)
-        ax.axhline(m['top1'], color='red', linestyle='--', alpha=0.6,
-                   label=f"top1={m['top1']:.2f}  PR={m['PR']:.1f}")
+        ax.bar(range(1, n_show + 1), m['evr'][:n_show] * 100, alpha=0.75, color='steelblue')
+        ax.plot(range(1, n_show + 1), m['cum_evr'][:n_show] * 100,
+                'r-o', markersize=3, linewidth=1.2, label='Cumulative')
+        ax.axhline(80, color='orange', linestyle='--', linewidth=0.8, label='80%')
+        ax.axhline(95, color='red',    linestyle='--', linewidth=0.8, label='95%')
         ax.set_xlabel('Component')
-        ax.set_ylabel('Explained Var Ratio')
-        ax.set_title(f'Scree – Block {li}, t={tracked[ki]}', fontsize=10)
-        ax.legend(fontsize=8)
-    fig3.suptitle('Scree Plots (Token-wise PCA)', fontsize=12)
+        ax.set_ylabel('Explained Var (%)')
+        ax.set_title(f'L{li}, t={tracked[ki]}\nPR={m["PR"]:.1f}  top1={m["top1"]*100:.1f}%',
+                     fontsize=9)
+        ax.legend(fontsize=7)
+    fig.suptitle('Scree Plots – Token-wise PCA (selected block × timestep)', fontsize=11)
     plt.tight_layout()
-    if save_prefix:
-        fig3.savefig(f'{save_prefix}_pca_scree.png', dpi=100, bbox_inches='tight')
-        print(f"  Saved {save_prefix}_pca_scree.png")
+    fig.savefig('pca_scree.png', dpi=100, bbox_inches='tight')
     plt.show()
+    plt.close(fig)
+    print("  Saved pca_scree.png")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 7. pca_motion_heatmap.png  (spec 5.7.C) – motion statistics per block
+    # ─────────────────────────────────────────────────────────────────────────
+    path_lens = np.array([r[2]['path_length'].mean()    if r[2] else 0.0
+                          for r in pca_results['traj']])
+    se_dists  = np.array([r[2]['start_end_dist'].mean() if r[2] else 0.0
+                          for r in pca_results['traj']])
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4))
+    bx = np.arange(L)
+    ax1.bar(bx, path_lens, alpha=0.8, color='steelblue')
+    ax1.set_xlabel('Block'); ax1.set_ylabel('Mean Path Length (PCA units)')
+    ax1.set_title('Avg Total Path Length per Block', fontsize=11)
+    ax1.set_xticks(range(0, L, blk_step))
+    ax2.bar(bx, se_dists, alpha=0.8, color='tomato')
+    ax2.set_xlabel('Block'); ax2.set_ylabel('Mean Start-End Distance (PCA units)')
+    ax2.set_title('Avg Start→End Distance per Block', fontsize=11)
+    ax2.set_xticks(range(0, L, blk_step))
+    fig.suptitle('Trajectory Motion Statistics per Block', fontsize=12)
+    plt.tight_layout()
+    fig.savefig('pca_motion_heatmap.png', dpi=100, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
+    print("  Saved pca_motion_heatmap.png")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 8. pca_token_scatter.png  (spec 3.6.C) – 2D token scatter for selected (l,t)
+    # ─────────────────────────────────────────────────────────────────────────
+    sel_lt = [(0, 0), (L // 2, T // 2), (L - 1, T - 1)]
+    fig, axes = plt.subplots(1, len(sel_lt), figsize=(5 * len(sel_lt), 5))
+    if len(sel_lt) == 1:
+        axes = [axes]
+    for ax, (li, ki) in zip(axes, sel_lt):
+        m = pca_results['token'][li][ki]
+        if m is None or 'proj2d' not in m:
+            continue
+        p2 = m['proj2d']             # [B*N, 2]
+        B_orig, N_orig = m['proj2d_shape']
+        # Color by spatial (patch) index to reveal spatial structure
+        patch_idx = np.tile(np.arange(N_orig), B_orig)
+        sc = ax.scatter(p2[:, 0], p2[:, 1], c=patch_idx, cmap='hsv',
+                        s=3, alpha=0.4)
+        plt.colorbar(sc, ax=ax, label='Patch index', shrink=0.8)
+        ax.set_title(f'Token PCA L{li}, t={tracked[ki]}\nPC1 vs PC2', fontsize=10)
+        ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+    fig.suptitle('Token-wise PCA: 2D scatter (color = patch spatial index)', fontsize=11)
+    plt.tight_layout()
+    fig.savefig('pca_token_scatter.png', dpi=100, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
+    print("  Saved pca_token_scatter.png")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 9. image_pca_scatter.png  (spec 4.6.B) – 2D image scatter for selected (l,t)
+    # ─────────────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, len(sel_lt), figsize=(5 * len(sel_lt), 5))
+    if len(sel_lt) == 1:
+        axes = [axes]
+    for ax, (li, ki) in zip(axes, sel_lt):
+        m = pca_results['image'][li][ki]
+        if m is None or 'proj_img' not in m:
+            continue
+        p2 = m['proj_img']           # [B, 2]
+        ax.scatter(p2[:, 0], p2[:, 1], s=80, alpha=0.9, zorder=3)
+        for b in range(p2.shape[0]):
+            ax.annotate(str(b), (p2[b, 0], p2[b, 1]), fontsize=8, ha='center')
+        ax.set_title(f'Image PCA L{li}, t={tracked[ki]}\nPC1 vs PC2', fontsize=10)
+        ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+    fig.suptitle('Image-wise PCA: 2D scatter (each point = one image)', fontsize=11)
+    plt.tight_layout()
+    fig.savefig('image_pca_scatter.png', dpi=100, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
+    print("  Saved image_pca_scatter.png")
 
 
 def main(args):
@@ -571,9 +815,13 @@ if __name__ == "__main__":
                         help="Enable cross-timestep block cosine similarity tracking")
     parser.add_argument("--run-pca", action="store_true",
                         help="Run token-wise, image-wise, and trajectory PCA on block tokens")
-    parser.add_argument("--track-timesteps", type=int, nargs="+",
-                        default=[1, 4, 8, 16, 32, 48, 64, 80, 96, 127],
-                        help="Timestep indices to track for similarity / PCA (default: 10 steps)")
+    parser.add_argument("--n-track-levels", type=int, default=10,
+                        help="Number of evenly-spaced noise levels to track (default: 10). "
+                             "Levels are auto-selected from the actual sampling schedule to "
+                             "ensure they span the full denoising range.")
+    parser.add_argument("--track-timesteps", type=int, nargs="+", default=None,
+                        help="Explicit DDPM timestep values to track (overrides --n-track-levels). "
+                             "Values must exist in the sampling schedule.")
 
     args = parser.parse_args()
     main(args)
